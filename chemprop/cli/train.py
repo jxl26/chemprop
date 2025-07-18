@@ -9,6 +9,9 @@ import sys
 from tempfile import TemporaryDirectory
 from typing import Literal
 from urllib.request import urlretrieve
+import csv
+import tqdm
+import pickle
 
 from configargparse import ArgumentError, ArgumentParser, Namespace
 from lightning import pytorch as pl
@@ -897,27 +900,96 @@ def save_config(parser: ArgumentParser, args: Namespace, config_path: Path):
 
 
 def save_smiles_splits(args: Namespace, output_dir, train_dset, val_dset, test_dset):
-    match (args.smiles_columns, args.reaction_columns):
-        case [_, None]:
-            column_labels = deepcopy(args.smiles_columns)
-        case [None, _]:
-            column_labels = deepcopy(args.reaction_columns)
-        case _:
-            column_labels = deepcopy(args.smiles_columns)
-            column_labels.extend(args.reaction_columns)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-    train_smis = train_dset.names
-    df_train = pd.DataFrame(train_smis, columns=column_labels)
-    df_train.to_csv(output_dir / "train_smiles.csv", index=False)
+    # --- build SMILES / reaction column list ---
+    if args.smiles_columns and not args.reaction_columns:
+        column_labels = list(args.smiles_columns)
+    elif args.reaction_columns and not args.smiles_columns:
+        column_labels = list(args.reaction_columns)
+    else:
+        column_labels = list(args.smiles_columns or []) + list(args.reaction_columns or [])
 
-    val_smis = val_dset.names
-    df_val = pd.DataFrame(val_smis, columns=column_labels)
-    df_val.to_csv(output_dir / "val_smiles.csv", index=False)
+    # --- direct attribute access from args ---
+    target_cols     = list(args.target_columns or train_dset.task_names)
+    feat_paths      = args.features_path
+    constraints_path= args.constraints_path
+    data_path       = args.data_path
+    logger: logging.Logger | None = args.logger
+    log = logger.info if logger else print
 
-    if test_dset is not None:
-        test_smis = test_dset.names
-        df_test = pd.DataFrame(test_smis, columns=column_labels)
-        df_test.to_csv(output_dir / "test_smiles.csv", index=False)
+    # --- read headers for features / constraints, if present ---
+    feat_header, constraints_header = [], []
+    if feat_paths and all(Path(p).suffix == ".csv" for p in feat_paths):
+        for p in feat_paths:
+            with open(p) as f:
+                feat_header.extend(next(csv.reader(f)))
+    if constraints_path:
+        with open(constraints_path) as f:
+            constraints_header = next(csv.reader(f))
+
+    # helper to write a single split
+    def _write_split(dset, tag):
+        if dset is None:
+            return
+        # SMILES-only file
+        pd.DataFrame(dset.names, columns=column_labels).to_csv(output_dir / f"{tag}_smiles.csv", index=False)
+        # SMILES + targets
+        if target_cols:
+            targets = np.asarray(dset.targets())[:, : len(target_cols)].tolist()
+            rows = [s + t for s, t in zip(dset.names, targets)]
+            pd.DataFrame(rows, columns=column_labels + target_cols).to_csv(output_dir / f"{tag}_full.csv", index=False)
+        # features
+        if feat_paths:
+            feats = dset.features()
+            if feat_header:
+                pd.DataFrame(feats, columns=feat_header).to_csv(output_dir / f"{tag}_features.csv", index=False)
+            else:
+                np.save(output_dir / f"{tag}_features.npy", feats)
+        # constraints
+        if constraints_path:
+            cons = [dp.raw_constraints for dp in dset._data]
+            pd.DataFrame(cons, columns=constraints_header).to_csv(output_dir / f"{tag}_constraints.csv", index=False)
+        # data weights
+        w = dset.data_weights()
+        if any(x != 1 for x in w):
+            pd.DataFrame(w, columns=["data weights"]).to_csv(output_dir / f"{tag}_weights.csv", index=False)
+
+    _write_split(train_dset, "train")
+    _write_split(val_dset, "val")
+    _write_split(test_dset, "test")
+
+    # save split indices when uniquely determinable
+    if data_path:
+        save_idx, idx_by_smiles = True, {}
+        with open(data_path) as f:
+            for i, row in enumerate(tqdm(csv.DictReader(f))):
+                key = tuple(row[c] for c in column_labels)
+                if key in idx_by_smiles:
+                    save_idx = False
+                    log("Repeated SMILES found; split_indices.pckl will not be written.")
+                    break
+                idx_by_smiles[key] = i
+        if save_idx:
+            all_idx = []
+            for d in (train_dset, val_dset, test_dset):
+                if d is None:
+                    continue
+                split = []
+                for sm in d.names:
+                    idx = idx_by_smiles.get(tuple(sm))
+                    if idx is None:
+                        save_idx = False
+                        log("SMILES not in main data file; split_indices.pckl skipped.")
+                        break
+                    split.append(idx)
+                if not save_idx:
+                    break
+                split.sort()
+                all_idx.append(split)
+        if save_idx:
+            with open(output_dir / "split_indices.pckl", "wb") as f:
+                pickle.dump(all_idx, f)
 
 
 def build_splits(args, format_kwargs, featurization_kwargs):
