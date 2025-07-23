@@ -39,6 +39,7 @@ from chemprop.cli.utils import (
     make_dataset,
     parse_activation,
     parse_indices,
+    save_smiles_splits,
 )
 from chemprop.cli.utils.args import uppercase
 from chemprop.data import (
@@ -896,28 +897,28 @@ def save_config(parser: ArgumentParser, args: Namespace, config_path: Path):
     parser.write_config_file(parsed_namespace=config_args, output_file_paths=[str(config_path)])
 
 
-def save_smiles_splits(args: Namespace, output_dir, train_dset, val_dset, test_dset):
-    match (args.smiles_columns, args.reaction_columns):
-        case [_, None]:
-            column_labels = deepcopy(args.smiles_columns)
-        case [None, _]:
-            column_labels = deepcopy(args.reaction_columns)
-        case _:
-            column_labels = deepcopy(args.smiles_columns)
-            column_labels.extend(args.reaction_columns)
+# def save_smiles_splits(args: Namespace, output_dir, train_dset, val_dset, test_dset):
+#     match (args.smiles_columns, args.reaction_columns):
+#         case [_, None]:
+#             column_labels = deepcopy(args.smiles_columns)
+#         case [None, _]:
+#             column_labels = deepcopy(args.reaction_columns)
+#         case _:
+#             column_labels = deepcopy(args.smiles_columns)
+#             column_labels.extend(args.reaction_columns)
 
-    train_smis = train_dset.names
-    df_train = pd.DataFrame(train_smis, columns=column_labels)
-    df_train.to_csv(output_dir / "train_smiles.csv", index=False)
+#     train_smis = train_dset.names
+#     df_train = pd.DataFrame(train_smis, columns=column_labels)
+#     df_train.to_csv(output_dir / "train_smiles.csv", index=False)
 
-    val_smis = val_dset.names
-    df_val = pd.DataFrame(val_smis, columns=column_labels)
-    df_val.to_csv(output_dir / "val_smiles.csv", index=False)
+#     val_smis = val_dset.names
+#     df_val = pd.DataFrame(val_smis, columns=column_labels)
+#     df_val.to_csv(output_dir / "val_smiles.csv", index=False)
 
-    if test_dset is not None:
-        test_smis = test_dset.names
-        df_test = pd.DataFrame(test_smis, columns=column_labels)
-        df_test.to_csv(output_dir / "test_smiles.csv", index=False)
+#     if test_dset is not None:
+#         test_smis = test_dset.names
+#         df_test = pd.DataFrame(test_smis, columns=column_labels)
+#         df_test.to_csv(output_dir / "test_smiles.csv", index=False)
 
 
 def build_splits(args, format_kwargs, featurization_kwargs):
@@ -2002,7 +2003,7 @@ def main(args):
         train_dset, val_dset, test_dset = build_datasets(args, train_data, val_data, test_data)
 
         if args.save_smiles_splits:
-            save_smiles_splits(args, output_dir, train_dset, val_dset, test_dset)
+            save_smiles_splits(args.data_path, output_dir, None, None, args.constraints_path, train_dset, val_dset, test_dset, args.smiles_columns, args.loss_function, None)
 
         input_transforms = (None, None, None, None)
         output_transform = (
