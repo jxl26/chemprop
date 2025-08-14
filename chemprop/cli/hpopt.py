@@ -270,6 +270,11 @@ def add_hpopt_args(parser: ArgumentParser) -> ArgumentParser:
         help="Passed directly to ``HyperOptSearch`` to control random state seed",
     )
 
+    hyperopt_args.add_argument(
+        "--hpopt-average-replicates",
+        action = "store_true",
+        help="If multiple replicate splits are available, train/evaluate each trial on all replicates and average the tracking metric",
+    )
     return parser
 
 
@@ -366,13 +371,84 @@ def update_args_with_config(args: Namespace, config: dict) -> Namespace:
 def train_model(config, args, train_dset, val_dset, logger, output_transform, input_transforms):
     args = update_args_with_config(args, config)
 
+    if getattr(args, "hpopt_average_replicates", False) and isinstance(train_dset, list):
+        scores = []
+
+        for rep_idx, (tr_d, va_d) in enumerate(zip(train_dset, val_dset)):
+            train_loader = build_dataloader(
+                tr_d, args.batch_size, args.num_workers, seed=args.data_seed
+            )
+            val_loader = build_dataloader(va_d, args.batch_size, args.num_workers, shuffle=False)
+
+            seed = args.pytorch_seed if args.pytorch_seed is not None else torch.seed()
+            torch.manual_seed(seed)
+
+            if "regression" in args.task_type:
+                if isinstance(tr_d, MolAtomBondDataset):
+                    rep_output_transform = []
+                    for kind, cols in zip(
+                        ["mol", "atom", "bond"],
+                        [args.mol_target_columns, args.atom_target_columns, args.bond_target_columns],
+                    ):
+                        if cols is not None:
+                            sc = tr_d.normalize_targets(kind)
+                            va_d.normalize_targets(kind, sc)
+                            rep_output_transform.append(UnscaleTransform.from_standard_scaler(sc))
+                        else:
+                            rep_output_transform.append(None)
+                else:
+                    sc = tr_d.normalize_targets()
+                    va_d.normalize_targets(sc)
+                    rep_output_transform = UnscaleTransform.from_standard_scaler(sc)
+            else:
+                rep_output_transform = [None, None, None] if isinstance(tr_d, MolAtomBondDataset) else None
+
+            if isinstance(train_loader.dataset, MolAtomBondDataset):
+                model = build_MAB_model(args, train_loader.dataset, rep_output_transform, input_transforms)
+            else:
+                model = build_model(args, train_loader.dataset, rep_output_transform, input_transforms)
+            logger.info(f"[replicate {rep_idx}] {model}")
+
+            if args.tracking_metric == "val_loss":
+                if isinstance(train_loader.dataset, MolAtomBondDataset):
+                    T_tracking_metric = next(c.__class__ for c in model.criterions if c is not None)
+                else:
+                    T_tracking_metric = model.criterion.__class__
+            else:
+                T_tracking_metric = MetricRegistry[args.tracking_metric.split("/")[1]]
+            monitor_mode = "max" if T_tracking_metric.higher_is_better else "min"
+
+            patience = args.patience if args.patience is not None else args.epochs
+            early_stopping = EarlyStopping(args.tracking_metric, patience=patience, mode=monitor_mode)
+
+            trainer = pl.Trainer(
+                accelerator=args.accelerator,
+                devices=args.devices,
+                max_epochs=args.epochs,
+                gradient_clip_val=args.grad_clip,
+                strategy=RayDDPStrategy(),
+                callbacks=[RayTrainReportCallback(), early_stopping],
+                plugins=[RayLightningEnvironment()],
+                deterministic=args.pytorch_seed is not None,
+            )
+            trainer = prepare_trainer(trainer)
+            trainer.fit(model, train_loader, val_loader)
+
+            best = early_stopping.best_score
+            best_val = float(best.cpu().item()) if torch.is_tensor(best) else float(best)
+            scores.append(best_val)
+
+        avg_score = float(np.mean(scores)) if len(scores) > 0 else float("inf")
+        ray_train.report({args.tracking_metric: avg_score})
+        return
+
+    # Original single‑replicate path (unchanged)
     train_loader = build_dataloader(
         train_dset, args.batch_size, args.num_workers, seed=args.data_seed
     )
     val_loader = build_dataloader(val_dset, args.batch_size, args.num_workers, shuffle=False)
 
     seed = args.pytorch_seed if args.pytorch_seed is not None else torch.seed()
-
     torch.manual_seed(seed)
 
     if isinstance(train_loader.dataset, MolAtomBondDataset):
@@ -548,41 +624,20 @@ def main(args: Namespace):
     )
 
     train_data, val_data, test_data = build_splits(args, format_kwargs, featurization_kwargs)
-    train_dset, val_dset, test_dset = build_datasets(args, train_data[0], val_data[0], test_data[0])
-
-    input_transforms = normalize_inputs(train_dset, val_dset, args)
-
-    if "regression" in args.task_type:
-        if isinstance(train_dset, MolAtomBondDataset):
-            output_transform = []
-            for kind, cols in zip(
-                ["mol", "atom", "bond"],
-                [args.mol_target_columns, args.atom_target_columns, args.bond_target_columns],
-            ):
-                if cols is not None:
-                    output_scaler = train_dset.normalize_targets(kind)
-                    val_dset.normalize_targets(kind, output_scaler)
-                    logger.info(
-                        f"Train data ({kind}): mean = {output_scaler.mean_} | std = {output_scaler.scale_}"
-                    )
-                    output_transform.append(UnscaleTransform.from_standard_scaler(output_scaler))
-                else:
-                    output_transform.append(None)
-        else:
-            output_scaler = train_dset.normalize_targets()
-            val_dset.normalize_targets(output_scaler)
-            logger.info(f"Train data: mean = {output_scaler.mean_} | std = {output_scaler.scale_}")
-            output_transform = UnscaleTransform.from_standard_scaler(output_scaler)
+    
+    if getattr(args, "hpopt_average_replicates", False) and len(train_data) > 1:
+        train_dset = []
+        val_dset = []
+        for i in range(len(train_data)):
+            d_tr, d_va, _ = build_datasets(args, train_data[i], val_data[i], test_data[i])
+            train_dset.append(d_tr)
+            val_dset.append(d_va)
+        input_transforms = normalize_inputs(train_dset[0], val_dset[0], args)
     else:
-        output_transform = (
-            [None, None, None] if isinstance(train_dset, MolAtomBondDataset) else None
-        )
+        train_dset, val_dset, test_dset = build_datasets(args, train_data[0], val_data[0], test_data[0])
+        input_transforms = normalize_inputs(train_dset, val_dset, args)
 
-    train_loader = build_dataloader(
-        train_dset, args.batch_size, args.num_workers, seed=args.data_seed
-    )
-
-    if args.tracking_metric != "val_loss":  # i.e. non-default
+    if args.tracking_metric != "val_loss":
         if any(
             cols is not None
             for cols in [
@@ -598,19 +653,19 @@ def main(args: Namespace):
         args.tracking_metric = "val/" + args.tracking_metric
         monitor_mode = "max" if T_tracking_metric.higher_is_better else "min"
     else:
-        if isinstance(train_loader.dataset, MolAtomBondDataset):
-            model = build_MAB_model(args, train_loader.dataset, output_transform, input_transforms)
-            monitor_mode = (
-                "max"
-                if next(m[0].higher_is_better for m in model.metricss if m is not None)
-                else "min"
-            )
+        # Probe direction using the first replicate (or the only dataset)
+        _probe_tr = train_dset[0] if isinstance(train_dset, list) else train_dset
+        probe_loader = build_dataloader(_probe_tr, args.batch_size, args.num_workers, seed=args.data_seed)
+        if isinstance(probe_loader.dataset, MolAtomBondDataset):
+            _probe_model = build_MAB_model(args, probe_loader.dataset, output_transform=None, input_transforms=input_transforms)
+            higher_is_better = next(m[0].higher_is_better for m in _probe_model.metricss if m is not None)
         else:
-            model = build_model(args, train_loader.dataset, output_transform, input_transforms)
-            monitor_mode = "max" if model.metrics[0].higher_is_better else "min"
+            _probe_model = build_model(args, probe_loader.dataset, output_transform=None, input_transforms=input_transforms)
+            higher_is_better = _probe_model.metrics[0].higher_is_better
+        monitor_mode = "max" if higher_is_better else "min"
 
     results = tune_model(
-        args, train_dset, val_dset, logger, monitor_mode, output_transform, input_transforms
+        args, train_dset, val_dset, logger, monitor_mode, output_transform=None, input_transforms=input_transforms
     )
 
     best_result = results.get_best_result()
@@ -642,12 +697,3 @@ def main(args: Namespace):
     result_df.to_csv(all_progress_save_path, index=False)
 
     ray.shutdown()
-
-
-if __name__ == "__main__":
-    parser = ArgumentParser()
-    parser = HpoptSubcommand.add_args(parser)
-
-    logging.basicConfig(stream=sys.stdout, level=logging.DEBUG, force=True)
-    args = parser.parse_args()
-    HpoptSubcommand.func(args)
