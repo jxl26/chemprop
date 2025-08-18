@@ -371,7 +371,7 @@ def update_args_with_config(args: Namespace, config: dict) -> Namespace:
 def train_model(config, args, train_dset, val_dset, logger, output_transform, input_transforms):
     args = update_args_with_config(args, config)
 
-    if getattr(args, "hpopt_average_replicates", False) and isinstance(train_dset, list):
+    if args.hpopt_average_replicates and isinstance(train_dset, list):
         scores = []
 
         for rep_idx, (tr_d, va_d) in enumerate(zip(train_dset, val_dset)):
@@ -439,7 +439,7 @@ def train_model(config, args, train_dset, val_dset, logger, output_transform, in
             scores.append(best_val)
 
         avg_score = float(np.mean(scores)) if len(scores) > 0 else float("inf")
-        ray_train.report({args.tracking_metric: avg_score})
+        ray.train.report({args.tracking_metric: avg_score})
         return
 
     # Original single‑replicate path (unchanged)
@@ -625,7 +625,7 @@ def main(args: Namespace):
 
     train_data, val_data, test_data = build_splits(args, format_kwargs, featurization_kwargs)
     
-    if getattr(args, "hpopt_average_replicates", False) and len(train_data) > 1:
+    if args.hpopt_average_replicates and len(train_data) > 1:
         train_dset = []
         val_dset = []
         for i in range(len(train_data)):
@@ -653,7 +653,6 @@ def main(args: Namespace):
         args.tracking_metric = "val/" + args.tracking_metric
         monitor_mode = "max" if T_tracking_metric.higher_is_better else "min"
     else:
-        # Probe direction using the first replicate (or the only dataset)
         _probe_tr = train_dset[0] if isinstance(train_dset, list) else train_dset
         probe_loader = build_dataloader(_probe_tr, args.batch_size, args.num_workers, seed=args.data_seed)
         if isinstance(probe_loader.dataset, MolAtomBondDataset):
