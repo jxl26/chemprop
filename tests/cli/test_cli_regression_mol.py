@@ -769,7 +769,6 @@ def test_hyperopt_quick(monkeypatch, data_path, tmp_path):
     assert (tmp_path / "model_0" / "best.pt").exists()
 
 
-@pytest.mark.skipif(NO_RAY or NO_HYPEROPT, reason="Ray and/or Hyperopt not installed")
 def test_hyperopt_average_replicates(monkeypatch, data_path, tmp_path):
     input_path, *_ = data_path
 
