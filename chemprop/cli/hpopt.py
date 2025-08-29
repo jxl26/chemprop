@@ -29,6 +29,10 @@ from chemprop.nn import AggregationRegistry, MetricRegistry
 from chemprop.nn.transforms import UnscaleTransform
 from chemprop.nn.utils import Activation
 
+from ray.train import Checkpoint as RayCheckpoint, report as ray_report
+import tempfile
+from lightning.pytorch.callbacks import ModelCheckpoint
+
 NO_RAY = False
 DEFAULT_SEARCH_SPACE = {
     "activation": None,
@@ -371,75 +375,80 @@ def update_args_with_config(args: Namespace, config: dict) -> Namespace:
 def train_model(config, args, train_dset, val_dset, logger, output_transform, input_transforms):
     args = update_args_with_config(args, config)
 
-    if args.hpopt_average_replicates and isinstance(train_dset, list):
-        scores = []
+    def _run_one(train_d, val_d, rep_idx: int):
+        train_loader = build_dataloader(
+            train_d, args.batch_size, args.num_workers, seed=args.data_seed
+        )
+        val_loader = build_dataloader(val_d, args.batch_size, args.num_workers, shuffle=False)
 
-        for rep_idx, (tr_d, va_d) in enumerate(zip(train_dset, val_dset)):
-            train_loader = build_dataloader(
-                tr_d, args.batch_size, args.num_workers, seed=args.data_seed
-            )
-            val_loader = build_dataloader(va_d, args.batch_size, args.num_workers, shuffle=False)
+        seed = args.pytorch_seed if args.pytorch_seed is not None else torch.seed()
+        torch.manual_seed(seed)
 
-            seed = args.pytorch_seed if args.pytorch_seed is not None else torch.seed()
-            torch.manual_seed(seed)
+        if isinstance(train_loader.dataset, MolAtomBondDataset):
+            model = build_MAB_model(args, train_loader.dataset, output_transform, input_transforms)
+            higher_is_better = next(m[0].higher_is_better for m in model.metricss if m is not None)
+        else:
+            model = build_model(args, train_loader.dataset, output_transform, input_transforms)
+            higher_is_better = model.metrics[0].higher_is_better
 
-            if "regression" in args.task_type:
-                if isinstance(tr_d, MolAtomBondDataset):
-                    rep_output_transform = []
-                    for kind, cols in zip(
-                        ["mol", "atom", "bond"],
-                        [args.mol_target_columns, args.atom_target_columns, args.bond_target_columns],
-                    ):
-                        if cols is not None:
-                            sc = tr_d.normalize_targets(kind)
-                            va_d.normalize_targets(kind, sc)
-                            rep_output_transform.append(UnscaleTransform.from_standard_scaler(sc))
-                        else:
-                            rep_output_transform.append(None)
-                else:
-                    sc = tr_d.normalize_targets()
-                    va_d.normalize_targets(sc)
-                    rep_output_transform = UnscaleTransform.from_standard_scaler(sc)
-            else:
-                rep_output_transform = [None, None, None] if isinstance(tr_d, MolAtomBondDataset) else None
-
+        if args.tracking_metric == "val_loss":
             if isinstance(train_loader.dataset, MolAtomBondDataset):
-                model = build_MAB_model(args, train_loader.dataset, rep_output_transform, input_transforms)
+                T_tracking_metric = next(c.__class__ for c in model.criterions if c is not None)
             else:
-                model = build_model(args, train_loader.dataset, rep_output_transform, input_transforms)
-            logger.info(f"[replicate {rep_idx}] {model}")
-
-            if args.tracking_metric == "val_loss":
-                if isinstance(train_loader.dataset, MolAtomBondDataset):
-                    T_tracking_metric = next(c.__class__ for c in model.criterions if c is not None)
-                else:
-                    T_tracking_metric = model.criterion.__class__
-            else:
-                T_tracking_metric = MetricRegistry[args.tracking_metric.split("/")[1]]
+                T_tracking_metric = model.criterion.__class__
             monitor_mode = "max" if T_tracking_metric.higher_is_better else "min"
+            monitor_name = "val_loss"
+        else:
+            T_tracking_metric = MetricRegistry[args.tracking_metric]
+            monitor_mode = "max" if T_tracking_metric.higher_is_better else "min"
+            monitor_name = "val/" + args.tracking_metric
 
-            patience = args.patience if args.patience is not None else args.epochs
-            early_stopping = EarlyStopping(args.tracking_metric, patience=patience, mode=monitor_mode)
+        patience = args.patience if args.patience is not None else args.epochs
+        early_stopping = EarlyStopping(monitor_name, patience=patience, mode=monitor_mode)
 
-            trainer = pl.Trainer(
-                accelerator=args.accelerator,
-                devices=args.devices,
-                max_epochs=args.epochs,
-                gradient_clip_val=args.grad_clip,
-                strategy=RayDDPStrategy(),
-                callbacks=[RayTrainReportCallback(), early_stopping],
-                plugins=[RayLightningEnvironment()],
-                deterministic=args.pytorch_seed is not None,
-            )
-            trainer = prepare_trainer(trainer)
-            trainer.fit(model, train_loader, val_loader)
+        tmp_ckpt_dir = Path(tempfile.mkdtemp(prefix=f"rep_{rep_idx}_"))
+        ckpt_cb = ModelCheckpoint(
+            dirpath=tmp_ckpt_dir,
+            filename="best",
+            monitor=monitor_name,
+            mode=monitor_mode,
+            save_top_k=1,
+            save_last=False,
+        )
 
-            best = early_stopping.best_score
-            best_val = float(best.cpu().item()) if torch.is_tensor(best) else float(best)
-            scores.append(best_val)
+        trainer = pl.Trainer(
+            accelerator=args.accelerator,
+            devices=args.devices,
+            max_epochs=args.epochs,
+            gradient_clip_val=args.grad_clip,
+            callbacks=[ckpt_cb, early_stopping],
+            deterministic=args.pytorch_seed is not None,
+        )
+        trainer.fit(model, train_loader, val_loader)
 
-        avg_score = float(np.mean(scores)) if len(scores) > 0 else float("inf")
-        ray.train.report({args.tracking_metric: avg_score})
+        best_metric = ckpt_cb.best_model_score.item() if ckpt_cb.best_model_score is not None else (
+            float("inf") if monitor_mode == "min" else -float("inf")
+        )
+        return best_metric, tmp_ckpt_dir
+
+    if args.hpopt_average_replicates and isinstance(train_dset, list):
+        per_rep_metrics = []
+        per_rep_ckpts = []
+        for rep_idx, (tr_d, va_d) in enumerate(zip(train_dset, val_dset)):
+            m, ck = _run_one(tr_d, va_d, rep_idx)
+            per_rep_metrics.append(m)
+            per_rep_ckpts.append(ck)
+
+        avg_metric = float(np.mean(per_rep_metrics))
+        if args.tracking_metric == "val_loss" or (hasattr(MetricRegistry, args.tracking_metric) and not MetricRegistry[args.tracking_metric].higher_is_better):
+            best_idx = int(np.argmin(per_rep_metrics))
+        else:
+            best_idx = int(np.argmax(per_rep_metrics))
+
+        ray_report(
+            metrics={args.tracking_metric if args.tracking_metric.startswith("val/") else ("val/" + args.tracking_metric): avg_metric},
+            checkpoint=RayCheckpoint.from_directory(str(per_rep_ckpts[best_idx])),
+        )
         return
 
     # Original single‑replicate path (unchanged)
@@ -669,7 +678,7 @@ def main(args: Namespace):
 
     best_result = results.get_best_result()
     best_config = best_result.config["train_loop_config"]
-    best_checkpoint_path = Path(best_result.checkpoint.path) / "checkpoint.ckpt"
+    best_checkpoint_path = Path(best_result.checkpoint.path) / "best.pt"
 
     best_config_save_path = args.hpopt_save_dir / "best_config.toml"
     best_checkpoint_save_path = args.hpopt_save_dir / "best_checkpoint.ckpt"
